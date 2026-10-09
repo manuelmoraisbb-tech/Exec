@@ -1,0 +1,152 @@
+name: Resolver links finais
+
+on:
+  workflow_dispatch:        # botão "Run workflow" no separador Actions
+  push:
+    paths: ["links.zip"]    # corre sozinho quando enviares um links.zip novo
+
+permissions:
+  contents: write
+
+concurrency:
+  group: resolver
+  cancel-in-progress: false
+
+jobs:
+  resolver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Descomprimir links.zip
+        run: |
+          unzip -o links.zip
+          ls -lh links.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolver os links
+        run: |
+          cat > resolver_ci.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # resolver_ci.py - lê links.json e gera links2.json com os links finais (para GitHub Actions)
+          import json
+          import sys
+          import time
+          import urllib.request
+          import urllib.error
+          from urllib.parse import urljoin
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+
+          ENTRADA = "links.json"
+          SAIDA = "links2.json"
+          CHAVES = ("url", "link")   # o extrator usa "link"
+          WORKERS = 40
+          HOPS = 10
+          TIMEOUT = 20
+          TENTATIVAS = 2
+          HEADERS = {"User-Agent": "Mozilla/5.0"}
+          REDIR = (301, 302, 303, 307, 308)
+
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  return None
+
+
+          def resolve(url):
+              opener = urllib.request.build_opener(NoRedirect)
+              for _ in range(HOPS):
+                  for t in range(TENTATIVAS):
+                      try:
+                          r = opener.open(urllib.request.Request(url, headers=HEADERS), timeout=TIMEOUT)
+                          r.close()
+                          return url
+                      except urllib.error.HTTPError as e:
+                          loc = e.headers.get("Location")
+                          if e.code in REDIR and loc:
+                              url = urljoin(url, loc)
+                              break
+                          raise
+                      except Exception:
+                          if t == TENTATIVAS - 1:
+                              raise
+                          time.sleep(1)
+              return url
+
+
+          def coletar(obj, lista):
+              """Guarda (dict, chave) para cada dict com 'url' ou 'link' em texto."""
+              if isinstance(obj, dict):
+                  for k in CHAVES:
+                      if isinstance(obj.get(k), str):
+                          lista.append((obj, k))
+                          break
+                  for v in obj.values():
+                      coletar(v, lista)
+              elif isinstance(obj, list):
+                  for v in obj:
+                      coletar(v, lista)
+
+
+          def main():
+              with open(ENTRADA, encoding="utf-8") as f:
+                  dados = json.load(f)
+
+              itens = []
+              coletar(dados, itens)
+              total = len(itens)
+              print(f"{total} links encontrados", flush=True)
+
+              ok = falhas = 0
+              t0 = time.time()
+              with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                  futuros = {ex.submit(resolve, d[k]): (d, k) for d, k in itens}
+                  for n, fut in enumerate(as_completed(futuros), 1):
+                      d, k = futuros[fut]
+                      try:
+                          d[k] = fut.result()
+                          ok += 1
+                      except Exception as e:
+                          falhas += 1
+                          if falhas <= 20:
+                              print(f"ERRO ({d.get('nome', d[k])}): {e}", file=sys.stderr, flush=True)
+                      if n % 500 == 0 or n == total:
+                          print(f"[{n}/{total}] ok={ok} erros={falhas} ({int(time.time() - t0)}s)", flush=True)
+
+              if ok == 0:
+                  sys.exit("Nenhum link foi resolvido (o servidor pode estar a bloquear o GitHub).")
+
+              with open(SAIDA, "w", encoding="utf-8") as f:
+                  json.dump(dados, f, ensure_ascii=False, separators=(",", ":"))
+              print(f"Guardado em {SAIDA}", flush=True)
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python resolver_ci.py
+
+      - name: Comprimir links2.json
+        run: |
+          zip -9 links2.zip links2.json
+          ls -lh links2.zip
+
+      - name: Guardar cópia (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: links2
+          path: links2.zip
+          retention-days: 7
+
+      - name: Guardar links2.zip no repositório
+        run: |
+          rm -f links.json links2.json resolver_ci.py
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add links2.zip
+          git diff --cached --quiet || git commit -m "Atualiza links2.zip (links finais)"
+          git push
